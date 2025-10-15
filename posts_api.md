@@ -23,14 +23,18 @@
 게시물 생성
 
 - 인증: 필요
-- 요청 헤더: `Content-Type: application/json`
-- 요청 바디 (JSON):
+- 요청 형식:
+  - 기본: `Content-Type: application/json`
+  - 이미지 포함 시: `multipart/form-data` (`images` 필드 사용)
+- 요청 바디:
   - `title` (string, required)
   - `content` (string, required)
   - `is_anonymous` (boolean | "1" | "true" 등, optional, default false)
+  - `images` (multipart file[], optional, 허용 확장자: jpg/jpeg/png/gif/webp, 1파일 최대 5MB 기본값)
 - 동작:
   - 세션의 `student_id` 존재 확인(Students 테이블).
   - Posts에 레코드 삽입.
+  - 이미지가 있다면 파일을 저장하고 `PostImages`에 메타데이터 기록.
   - 삽입 후 `LAST_INSERT_ID()`로 `post_id` 반환.
 - 응답:
   - 성공: 201
@@ -38,17 +42,37 @@
     {
       "status": "success",
       "message": "게시물 작성 성공",
-      "post_id": 123
+      "post_id": 123,
+      "images": [
+        {
+          "image_id": 1,
+          "original_name": "sample.png",
+          "url": "/api/posts/images/3f...ab.png",
+          "content_type": "image/png",
+          "file_size": 102400
+        }
+      ]
     }
     ```
   - 입력 누락: 400, `{"status":"error","message":"제목과 내용을 모두 입력하세요."}`
+  - 이미지 검증 실패: 400, 원인별 메시지 반환
   - 세션 불일치: 401, `{"status":"error","message":"유효하지 않은 세션입니다. 다시 로그인해 주세요."}`
 
 예:
 ```bash
+# JSON 전송
 curl -X POST /api/posts/ \
   -H "Content-Type: application/json" \
   -d '{"title":"제목","content":"내용","is_anonymous":true}'
+
+# 이미지 포함 multipart 예시
+curl -X POST /api/posts/ \
+  -H "Content-Type: multipart/form-data" \
+  -F "title=제목" \
+  -F "content=본문" \
+  -F "is_anonymous=false" \
+  -F "images=@/path/to/image1.png" \
+  -F "images=@/path/to/image2.jpg"
 ```
 
 ---
@@ -63,6 +87,7 @@ curl -X POST /api/posts/ \
 - 동작:
   - 전체 개수 조회 `SELECT COUNT(*) FROM Posts`
   - 게시물과 작성자(Students) 조인으로 목록 조회. 각 항목에 댓글 수(subquery) 포함. 여기서 댓글 수는 `Comments`만 집계되며 대댓글은 포함되지 않습니다.
+  - 관련 이미지가 있으면 `PostImages`에서 메타데이터를 가져와 `images` 배열 반환.
   - 익명 글은 `student_id`를 NULL로, `student_name`을 "익명"으로 반환.
 - 응답: 200
   ```json
@@ -81,7 +106,16 @@ curl -X POST /api/posts/ \
         "is_anonymous": false,
         "like_count": 5,
         "comment_count": 2,
-        "created_at": "2025-08-27 12:00:00"
+        "created_at": "2025-08-27 12:00:00",
+        "images": [
+          {
+            "image_id": 1,
+            "original_name": "sample.png",
+            "url": "/api/posts/images/3f...ab.png",
+            "content_type": "image/png",
+            "file_size": 102400
+          }
+        ]
       },
       ...
     ]
@@ -222,7 +256,7 @@ curl -X POST /api/posts/1/like/
 - 인증: 불필요 (공개)
 - 경로 파라미터: `post_id` (int)
 - 동작:
-  - 게시물 상세 조회(작성자명은 익명 처리 반영).
+  - 게시물 상세 조회(작성자명은 익명 처리 반영) 및 첨부 이미지 목록(`PostImages`).
   - 해당 게시물의 댓글 목록 조회(작성자명 익명 처리). 대댓글은 포함되지 않으며 별도 API로 조회합니다.
   - 댓글은 `created_at` 오름차순으로 정렬.
 - 응답: 200
@@ -237,7 +271,16 @@ curl -X POST /api/posts/1/like/
       "content": "...",
       "is_anonymous": false,
       "like_count": 5,
-      "created_at": "2025-08-27 12:00:00"
+      "created_at": "2025-08-27 12:00:00",
+      "images": [
+        {
+          "image_id": 1,
+          "original_name": "sample.png",
+          "url": "/api/posts/images/3f...ab.png",
+          "content_type": "image/png",
+          "file_size": 102400
+        }
+      ]
     },
     "comments": [
       {
@@ -256,11 +299,25 @@ curl -X POST /api/posts/1/like/
 
 ---
 
+## GET /api/posts/images/<filename>
+게시물 이미지 다운로드
+
+- 인증: 불필요 (이미지 URL은 게시글 공개 범위와 동일하게 취급)
+- 경로 파라미터: `filename` (업로드 시 부여된 저장 파일명)
+- 동작:
+  - 업로드 디렉터리(`POST_IMAGE_UPLOAD_FOLDER`)에서 파일을 찾아 전송.
+- 응답:
+  - 성공: 200, 실제 이미지 바이너리 반환 (적절한 `Content-Type` 설정)
+  - 파일 없음: 404
+
+---
+
 ## DB/스키마 관련 힌트 (코드에서 사용되는 테이블들)
 - Posts (post_id, student_id, title, content, is_anonymous, like_count, created_at, ...)
 - Students (student_id, student_name, ...)
 - Comments (comment_id, post_id, student_id, content, is_anonymous, created_at, ...)
 - PostLikes (post_id, student_id)
 - Sub_comments (sub_comment_id, comment_id, student_id, content, is_anonymous, created_at)
+- PostImages (image_id, post_id, original_name, stored_name, content_type, file_size, created_at)
 
 ---

@@ -1,62 +1,40 @@
-from flask import Blueprint, request, session, jsonify
+from flask import jsonify, request
+
 from utils.database_util import DatabaseManager
 
-post_bp = Blueprint('post', __name__)
-
-
-def _require_login():
-    sid = session.get('session_student_id')
-    if not sid:
-        return None, (jsonify({
-            "status": "error",
-            "message": "로그인이 필요합니다."
-        }), 401)
-    # 세션 유효성 (옵션) 확인
-    db = DatabaseManager()
-    exists = db.query(
-        """
-        SELECT 1 FROM Students WHERE student_id = %(sid)s
-        """,
-        sid=sid
-    ).result
-    if not exists:
-        return None, (jsonify({
-            "status": "error",
-            "message": "유효하지 않은 세션입니다. 다시 로그인해 주세요."
-        }), 401)
-    return sid, None
-
-
-def _to_bool(value, default=False):
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int):
-        return value != 0
-    if isinstance(value, str):
-        v = value.strip().lower()
-        return v in ("1", "true", "t", "yes", "y", "on")
-    return default
+from . import post_bp
+from .image_service import (
+    cleanup_saved_images,
+    collect_image_files,
+    fetch_post_images,
+    save_post_images,
+)
+from .utils import parse_request_payload, require_login, to_bool
 
 
 @post_bp.route('/api/posts/', methods=['POST'])
 def create_post():
+    db = None
+    saved_images = []
     try:
-        sid, err = _require_login()
+        sid, err = require_login()
         if err:
             return err
 
-        payload = request.get_json(silent=True) or {}
+        is_multipart = request.content_type and 'multipart/form-data' in request.content_type
+        payload = parse_request_payload()
         title = (payload.get('title') or '').strip()
         content = (payload.get('content') or '').strip()
-        is_anonymous = 1 if _to_bool(payload.get('is_anonymous'), False) else 0
+        is_anonymous = 1 if to_bool(payload.get('is_anonymous'), False) else 0
 
         if not title or not content:
             return jsonify({
                 "status": "error",
                 "message": "제목과 내용을 모두 입력하세요."
             }), 400
+
+        image_files = collect_image_files() if is_multipart else []
+        saved_images = save_post_images(image_files)
 
         db = DatabaseManager()
         db.query(
@@ -70,19 +48,58 @@ def create_post():
             is_anonymous=is_anonymous
         )
         post_id_row = db.query("SELECT LAST_INSERT_ID()")
+
+        post_id = post_id_row.result[0][0] if post_id_row.result else None
+
+        if post_id is None:
+            raise ValueError("게시물 ID를 가져올 수 없습니다.")
+
+        if saved_images:
+            db.query_many(
+                """
+                INSERT INTO PostImages (post_id, original_name, stored_name, content_type, file_size)
+                VALUES (%(post_id)s, %(original_name)s, %(stored_name)s, %(content_type)s, %(file_size)s)
+                """,
+                [
+                    {
+                        'post_id': post_id,
+                        'original_name': img['original_name'],
+                        'stored_name': img['stored_name'],
+                        'content_type': img['content_type'],
+                        'file_size': img['file_size']
+                    }
+                    for img in saved_images
+                ]
+            )
+
         db.commit()
 
-        # LAST_INSERT_ID() 결과 파싱
-        post_id = None
-        if post_id_row.result and len(post_id_row.result[0]) > 0:
-            post_id = post_id_row.result[0][0]
+        images = fetch_post_images(db, [post_id]).get(post_id, [])
 
         return jsonify({
             "status": "success",
             "message": "게시물 작성 성공",
-            "post_id": post_id
+            "post_id": post_id,
+            "images": images
         }), 201
+    except ValueError as ve:
+        cleanup_saved_images(saved_images)
+        if db and getattr(db, 'db_conn', None):
+            try:
+                db.db_conn.rollback()
+            except Exception:
+                pass
+        return jsonify({
+            "status": "error",
+            "message": str(ve)
+        }), 400
     except Exception as e:
+        cleanup_saved_images(saved_images)
+        if db and getattr(db, 'db_conn', None):
+            try:
+                db.db_conn.rollback()
+            except Exception:
+                pass
         return jsonify({
             "status": "error",
             "message": "서버 오류가 발생했습니다.",
@@ -93,7 +110,6 @@ def create_post():
 @post_bp.route('/api/posts/', methods=['GET'])
 def list_posts():
     try:
-        # 페이징 파라미터
         try:
             page = int(request.args.get('page', 1))
             size = int(request.args.get('size', 10))
@@ -136,10 +152,12 @@ def list_posts():
         ).result
 
         items = []
+        post_ids = []
         for r in rows:
             (post_id, student_id, student_name, title, content, is_anonymous,
              like_count, created_at, comment_count) = r
             anon = bool(is_anonymous)
+            post_ids.append(post_id)
             items.append({
                 "post_id": post_id,
                 "student_id": None if anon else student_id,
@@ -151,6 +169,10 @@ def list_posts():
                 "comment_count": comment_count,
                 "created_at": created_at
             })
+
+        images_map = fetch_post_images(db, post_ids)
+        for item in items:
+            item["images"] = images_map.get(item["post_id"], [])
 
         return jsonify({
             "status": "success",
@@ -209,6 +231,8 @@ def get_post_detail(post_id: int):
             "created_at": created_at
         }
 
+        post_obj["images"] = fetch_post_images(db, [post_id]).get(post_id, [])
+
         comments = db.query(
             """
             SELECT 
@@ -252,75 +276,14 @@ def get_post_detail(post_id: int):
         }), 500
 
 
-@post_bp.route('/api/posts/<int:post_id>/comments/', methods=['POST'])
-def create_comment(post_id: int):
-    try:
-        sid, err = _require_login()
-        if err:
-            return err
-
-        payload = request.get_json(silent=True) or {}
-        content = (payload.get('content') or '').strip()
-        is_anonymous = 1 if _to_bool(payload.get('is_anonymous'), False) else 0
-
-        if not content:
-            return jsonify({
-                "status": "error",
-                "message": "댓글 내용을 입력하세요."
-            }), 400
-
-        db = DatabaseManager()
-
-        # 게시물 존재 여부 확인
-        exists = db.query(
-            "SELECT 1 FROM Posts WHERE post_id = %(post_id)s",
-            post_id=post_id
-        ).result
-        if not exists:
-            return jsonify({
-                "status": "error",
-                "message": "게시물을 찾을 수 없습니다."
-            }), 404
-
-        db.query(
-            """
-            INSERT INTO Comments (post_id, student_id, content, is_anonymous)
-            VALUES (%(post_id)s, %(sid)s, %(content)s, %(is_anonymous)s)
-            """,
-            post_id=post_id,
-            sid=sid,
-            content=content,
-            is_anonymous=is_anonymous
-        )
-        cid_row = db.query("SELECT LAST_INSERT_ID()")
-        db.commit()
-
-        comment_id = None
-        if cid_row.result and len(cid_row.result[0]) > 0:
-            comment_id = cid_row.result[0][0]
-
-        return jsonify({
-            "status": "success",
-            "message": "댓글 작성 성공",
-            "comment_id": comment_id
-        }), 201
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": "서버 오류가 발생했습니다.",
-            "detail": str(e)
-        }), 500
-
-
 @post_bp.route('/api/posts/<int:post_id>/like/', methods=['POST'])
 def toggle_like(post_id: int):
     try:
-        sid, err = _require_login()
+        sid, err = require_login()
         if err:
             return err
 
         db = DatabaseManager()
-        # 게시물 존재 확인
         post_exists = db.query(
             "SELECT 1 FROM Posts WHERE post_id = %(post_id)s",
             post_id=post_id
@@ -341,7 +304,6 @@ def toggle_like(post_id: int):
         ).result
 
         if liked_row:
-            # 좋아요 취소
             db.query(
                 "DELETE FROM PostLikes WHERE post_id = %(post_id)s AND student_id = %(sid)s",
                 post_id=post_id,
@@ -353,7 +315,6 @@ def toggle_like(post_id: int):
             )
             liked = False
         else:
-            # 좋아요 추가
             db.query(
                 "INSERT INTO PostLikes (post_id, student_id) VALUES (%(post_id)s, %(sid)s)",
                 post_id=post_id,
@@ -377,134 +338,6 @@ def toggle_like(post_id: int):
             "status": "success",
             "liked": liked,
             "like_count": like_count
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": "서버 오류가 발생했습니다.",
-            "detail": str(e)
-        }), 500
-
-
-@post_bp.route('/api/posts/<int:post_id>/comments/<int:comment_id>/replies/', methods=['POST'])
-def create_sub_comment(post_id: int, comment_id: int):
-    """대댓글 작성 API"""
-    try:
-        sid, err = _require_login()
-        if err:
-            return err
-
-        payload = request.get_json(silent=True) or {}
-        content = (payload.get('content') or '').strip()
-        is_anonymous = 1 if _to_bool(payload.get('is_anonymous'), False) else 0
-
-        if not content:
-            return jsonify({
-                "status": "error",
-                "message": "대댓글 내용을 입력하세요."
-            }), 400
-
-        db = DatabaseManager()
-
-        # 댓글이 해당 게시물에 속하는지 확인
-        comment_exists = db.query(
-            """
-            SELECT 1 FROM Comments 
-            WHERE comment_id = %(comment_id)s AND post_id = %(post_id)s
-            """,
-            comment_id=comment_id,
-            post_id=post_id
-        ).result
-        if not comment_exists:
-            return jsonify({
-                "status": "error",
-                "message": "대상 댓글을 찾을 수 없습니다."
-            }), 404
-
-        db.query(
-            """
-            INSERT INTO Sub_comments (comment_id, student_id, content, is_anonymous)
-            VALUES (%(comment_id)s, %(sid)s, %(content)s, %(is_anonymous)s)
-            """,
-            comment_id=comment_id,
-            sid=sid,
-            content=content,
-            is_anonymous=is_anonymous
-        )
-        scid_row = db.query("SELECT LAST_INSERT_ID()")
-        db.commit()
-
-        sub_comment_id = None
-        if scid_row.result and len(scid_row.result[0]) > 0:
-            sub_comment_id = scid_row.result[0][0]
-
-        return jsonify({
-            "status": "success",
-            "message": "대댓글 작성 성공",
-            "sub_comment_id": sub_comment_id
-        }), 201
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": "서버 오류가 발생했습니다.",
-            "detail": str(e)
-        }), 500
-
-
-@post_bp.route('/api/posts/<int:post_id>/comments/<int:comment_id>/replies/', methods=['GET'])
-def list_sub_comments(post_id: int, comment_id: int):
-    """특정 댓글의 대댓글 목록 조회 API"""
-    try:
-        db = DatabaseManager()
-
-        # 댓글이 해당 게시물에 속하는지 확인
-        comment_exists = db.query(
-            """
-            SELECT 1 FROM Comments 
-            WHERE comment_id = %(comment_id)s AND post_id = %(post_id)s
-            """,
-            comment_id=comment_id,
-            post_id=post_id
-        ).result
-        if not comment_exists:
-            return jsonify({
-                "status": "error",
-                "message": "대상 댓글을 찾을 수 없습니다."
-            }), 404
-
-        rows = db.query(
-            """
-            SELECT 
-                sc.sub_comment_id,
-                sc.student_id,
-                s.student_name,
-                sc.content,
-                sc.is_anonymous,
-                DATE_FORMAT(sc.created_at, '%%Y-%%m-%%d %%H:%%i:%%s') as created_at
-            FROM Sub_comments sc
-            LEFT JOIN Students s ON sc.student_id = s.student_id
-            WHERE sc.comment_id = %(comment_id)s
-            ORDER BY sc.created_at ASC
-            """,
-            comment_id=comment_id
-        ).result
-
-        sub_comments = []
-        for r in rows:
-            (scid, s_student_id, s_student_name, s_content, s_is_anonymous, s_created_at) = r
-            s_anon = bool(s_is_anonymous)
-            sub_comments.append({
-                "sub_comment_id": scid,
-                "student_id": None if s_anon else s_student_id,
-                "student_name": "익명" if s_anon else s_student_name,
-                "content": s_content,
-                "is_anonymous": s_anon,
-                "created_at": s_created_at
-            })
-
-        return jsonify({
-            "status": "success",
-            "sub_comments": sub_comments
         })
     except Exception as e:
         return jsonify({

@@ -1,3 +1,5 @@
+import json
+
 from flask import Blueprint, request, session, jsonify
 from utils.database_util import DatabaseManager
 
@@ -5,8 +7,36 @@ auth_bp = Blueprint('auth', __name__)
 
 @auth_bp.route("/login", methods = ['POST'])
 def login():
-    data = request.get_json()
-    input_student_id = data.get('student_id')
+    data = request.get_json(silent=True)
+
+    if data is None:
+        data = {}
+        if request.form:
+            payload = request.form.get('payload')
+            if payload:
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    data = {}
+            if not data:
+                data = {key: request.form.get(key) for key in request.form.keys()}
+                if '' in data and not {'student_id', 'password'} & data.keys():
+                    single_value = data.get('')
+                    if single_value:
+                        try:
+                            data = json.loads(single_value)
+                        except json.JSONDecodeError:
+                            pass
+        elif request.data:
+            try:
+                data = json.loads(request.data.decode('utf-8'))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                data = {}
+
+    if not isinstance(data, dict):
+        data = {}
+
+    input_student_id = (data.get('student_id') or '').strip()
     input_student_pw = data.get('password')
 
     # 입력값 체크
